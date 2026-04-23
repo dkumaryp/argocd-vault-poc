@@ -1,0 +1,95 @@
+# Strategic Merge Patch for argocd-repo-server
+# Adds the ArgoCD Vault Plugin (AVP) as a CMP sidecar container.
+# Uses Kubernetes auth — the sidecar presents its own SA token to Vault.
+# No static credentials (Role ID / Secret ID) needed.
+#
+# Apply with:
+#   kubectl patch deployment argocd-repo-server -n argocd --patch-file argocd-repo-server-patch.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argocd-repo-server
+  namespace: argocd
+spec:
+  template:
+    spec:
+      # Required — AVP reads the pod's SA token from the auto-mounted path
+      # /var/run/secrets/kubernetes.io/serviceaccount/token and sends it to
+      # Vault for Kubernetes auth validation.
+      automountServiceAccountToken: true
+
+      # ── Init container: downloads the AVP binary ─────────────────────────
+      initContainers:
+        - name: download-avp
+          image: alpine:3.18
+          command: [sh, -c]
+          args:
+            - |
+              AVP_VERSION=1.17.0
+              echo "Downloading argocd-vault-plugin v${AVP_VERSION}..."
+              wget -qO /custom-tools/argocd-vault-plugin \
+                "https://github.com/argoproj-labs/argocd-vault-plugin/releases/download/v${AVP_VERSION}/argocd-vault-plugin_${AVP_VERSION}_linux_amd64"
+              chmod +x /custom-tools/argocd-vault-plugin
+              echo "Done: $(ls -lh /custom-tools/argocd-vault-plugin)"
+          volumeMounts:
+            - name: custom-tools
+              mountPath: /custom-tools
+
+      # ── AVP sidecar container ─────────────────────────────────────────────
+      containers:
+        - name: avp
+          command: [/var/run/argocd/argocd-cmp-server]
+          image: alpine:3.18
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+          env:
+            # Vault server address (reachable from inside the cluster)
+            - name: VAULT_ADDR
+              valueFrom:
+                secretKeyRef:
+                  name: argocd-vault-plugin-credentials
+                  key: VAULT_ADDR
+            # AVP plugin type
+            - name: AVP_TYPE
+              valueFrom:
+                secretKeyRef:
+                  name: argocd-vault-plugin-credentials
+                  key: AVP_TYPE
+            # Use Kubernetes auth — AVP will automatically use the pod's mounted
+            # SA token at /var/run/secrets/kubernetes.io/serviceaccount/token
+            - name: AVP_AUTH_TYPE
+              valueFrom:
+                secretKeyRef:
+                  name: argocd-vault-plugin-credentials
+                  key: AVP_AUTH_TYPE
+            # The Vault role that maps argocd-repo-server SA → argocd-policy
+            - name: AVP_K8S_ROLE
+              valueFrom:
+                secretKeyRef:
+                  name: argocd-vault-plugin-credentials
+                  key: AVP_K8S_ROLE
+          volumeMounts:
+            - name: var-files
+              mountPath: /var/run/argocd
+            - name: plugins
+              mountPath: /home/argocd/cmp-server/plugins
+            - name: cmp-plugin
+              mountPath: /home/argocd/cmp-server/config/plugin.yaml
+              subPath: plugin.yaml
+            - name: custom-tools
+              mountPath: /usr/local/bin/argocd-vault-plugin
+              subPath: argocd-vault-plugin
+            - name: tmp-dir
+              mountPath: /tmp
+
+      # ── Additional volumes ────────────────────────────────────────────────
+      volumes:
+        - name: custom-tools
+          emptyDir: {}
+        - name: cmp-plugin
+          configMap:
+            name: cmp-plugin
+        - name: tmp-dir
+          emptyDir: {}
+

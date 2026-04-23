@@ -1,0 +1,25 @@
+version: "3.8"
+
+# DEV MODE - Auto-initializes, single unseal key, no TLS
+# Root token: "root"  |  Vault addr: http://localhost:8200
+# WARNING: Dev mode is NOT for production - data is lost on restart
+
+services:
+  vault:
+    image: hashicorp/vault:1.15.6
+    container_name: vault-poc-dev
+    restart: unless-stopped
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: "root"
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+      VAULT_ADDR: "http://0.0.0.0:8200"
+    cap_add:
+      - IPC_LOCK
+    command: server -dev
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

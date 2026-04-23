@@ -1,0 +1,36 @@
+# ConfigMap that defines the ArgoCD Vault Plugin (AVP) as a CMP sidecar plugin.
+# This ConfigMap is mounted into the avp sidecar container so ArgoCD knows
+# how to discover and generate manifests using the plugin.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cmp-plugin
+  namespace: argocd
+data:
+  plugin.yaml: |
+    apiVersion: argoproj.io/v1alpha1
+    kind: ConfigManagementPlugin
+    metadata:
+      name: argocd-vault-plugin
+    spec:
+      allowConcurrency: true
+
+      # Discovery: find apps that contain AVP placeholders or annotations
+      discover:
+        find:
+          command:
+            - sh
+            - "-c"
+            - |
+              find . -name '*.yaml' -o -name '*.yml' | \
+                xargs grep -l '<path\|avp\.kubernetes\.io' 2>/dev/null | \
+                head -1
+
+      # Generate: run AVP to replace placeholders with Vault secrets
+      generate:
+        command:
+          - argocd-vault-plugin
+          - generate
+          - ./
+
+      lockRepo: false

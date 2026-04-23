@@ -1,0 +1,41 @@
+# ServiceAccount that Vault uses to validate pod SA tokens via the K8s TokenReview API.
+# This is needed because Vault runs OUTSIDE the cluster (in Docker).
+#
+# Flow:
+#   1. AVP pod presents its own SA token to Vault
+#   2. Vault calls K8s TokenReview API using the vault-reviewer token
+#   3. K8s confirms the token is valid + returns the SA name/namespace
+#   4. Vault maps the SA to a policy and issues a short-lived Vault token
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault-reviewer
+  namespace: argocd
+---
+# system:auth-delegator allows the SA to call the TokenReview and
+# SubjectAccessReview APIs — exactly what Vault's kubernetes auth needs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vault-reviewer-auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: vault-reviewer
+    namespace: argocd
+---
+# K8s 1.24+ no longer auto-creates long-lived tokens.
+# We need an explicit Secret of type kubernetes.io/service-account-token.
+# Vault needs a non-expiring reviewer token to make TokenReview calls.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-reviewer-token
+  namespace: argocd
+  annotations:
+    kubernetes.io/service-account.name: vault-reviewer
+type: kubernetes.io/service-account-token

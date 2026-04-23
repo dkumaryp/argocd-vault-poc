@@ -1,0 +1,11 @@
+# Sensitive files — never commit these
+.vault-keys
+.avp-credentials
+
+# Docker volumes
+vault/data/
+
+# Editor
+.DS_Store
+*.swp
+*.swo
