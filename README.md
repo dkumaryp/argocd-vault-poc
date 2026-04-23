@@ -724,7 +724,7 @@ ArgoCD is GitOps-based — it syncs from a Git repository. You need to host the 
 ```bash
 # Option 1: Push this entire poc directory to GitHub
 git init
-git remote add origin https://github.com/YOUR_ORG/YOUR_REPO.git
+git remote add origin https://github.com/dkumaryp/argocd-vault-poc.git
 git add .
 git commit -m "feat: ArgoCD Vault Plugin POC"
 git push -u origin main
@@ -736,7 +736,7 @@ Edit `argocd/apps/demo-secret-app.yaml` and set your Git repo URL:
 
 ```yaml
 source:
-  repoURL: https://github.com/YOUR_ORG/YOUR_REPO.git
+  repoURL: https://github.com/dkumaryp/argocd-vault-poc.git
   targetRevision: HEAD
   path: argocd-vault-poc/demo-app   # adjust if your repo layout differs
 ```
@@ -744,7 +744,7 @@ source:
 #### 7c. Register the repo with ArgoCD (if private)
 
 ```bash
-argocd repo add https://github.com/YOUR_ORG/YOUR_REPO.git \
+argocd repo add https://github.com/dkumaryp/argocd-vault-poc.git \
   --username YOUR_USER \
   --password YOUR_PAT_TOKEN
 ```
