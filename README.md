@@ -577,18 +577,45 @@ kubectl delete pod vault-test
 
 ### Step 4 — Install ArgoCD
 
+> **POC recommendation**: Use `core-install.yaml` instead of `install.yaml`. The full install includes **Dex** (SSO/OIDC) and **Redis** (caching) which are not needed for this POC and will cause `ImagePullBackOff` from pulling large images inside the kind VM.
+
 ```bash
 # Create namespace
 kubectl apply -f argocd/install/namespace.yaml
 
-# Install ArgoCD (official manifests)
+# Install ArgoCD — core only (no Dex, no Redis, no notifications controller)
 kubectl apply -n argocd \
-  -f https://raw.githubusercontent.com/argoproj/argo-cd/v2.10.0/manifests/install.yaml
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/v2.10.0/manifests/core-install.yaml
 
 # Wait for all pods to be ready (~2 minutes)
 kubectl rollout status deployment/argocd-server -n argocd --timeout=180s
 kubectl get pods -n argocd
 ```
+
+<details>
+<summary>If you used full install.yaml and get ImagePullBackOff for redis or dex</summary>
+
+Image pulls from inside the kind VM can fail with `unexpected EOF` (transient network error). Fix by pulling on your Mac and loading directly into kind:
+
+```bash
+# Pull on Mac (fast, uses your Mac's Docker cache)
+docker pull redis:7.0.14-alpine
+docker pull ghcr.io/dexidp/dex:v2.37.0
+
+# Load directly into the kind cluster — bypasses in-VM network entirely
+kind load docker-image redis:7.0.14-alpine --name desktop
+kind load docker-image ghcr.io/dexidp/dex:v2.37.0 --name desktop
+
+# Delete stuck pods so they recreate using the cached images
+kubectl delete pod -n argocd -l app.kubernetes.io/name=argocd-redis
+kubectl delete pod -n argocd -l app.kubernetes.io/name=dex
+```
+
+Or just scale them to zero since they're not needed for the POC:
+```bash
+kubectl scale deployment argocd-dex-server argocd-redis -n argocd --replicas=0
+```
+</details>
 
 **Get the initial admin password:**
 
@@ -623,6 +650,8 @@ argocd login localhost:8080 \
 
 The AVP is installed as a **sidecar** in the `argocd-repo-server` pod using the CMP (Config Management Plugin) pattern.
 
+> ⚠️ **Complete Step 6 (create the credentials secret) BEFORE step 5c.** The patch references the secret — if it doesn't exist yet, the `avp` sidecar will crash on startup.
+
 #### 5a. Apply the vault-reviewer SA (if not done in Step 2)
 
 ```bash
@@ -635,11 +664,22 @@ kubectl apply -f argocd/install/vault-reviewer-sa.yaml
 kubectl apply -f argocd/plugins/cmp-plugin-configmap.yaml
 ```
 
-#### 5c. Patch the argocd-repo-server deployment
+#### 5c. Create the AVP credentials secret (Step 6 content — do this first)
+
+```bash
+kubectl create secret generic argocd-vault-plugin-credentials \
+  --namespace argocd \
+  --from-literal=VAULT_ADDR=http://${VAULT_KIND_IP}:8200 \
+  --from-literal=AVP_TYPE=vault \
+  --from-literal=AVP_AUTH_TYPE=k8s \
+  --from-literal=AVP_K8S_ROLE=argocd-role
+```
+
+#### 5d. Patch the argocd-repo-server deployment
 
 This adds:
-- An **init container** that downloads the AVP binary
-- An **AVP sidecar container** that runs the CMP server (reads SA token from `/var/run/secrets/kubernetes.io/serviceaccount/token`)
+- An **init container** (`alpine:3.18`) that downloads the AVP binary — uses the image already cached on the node
+- An **AVP sidecar** (`alpine:3.18`) that runs the CMP server and reads the pod's SA token
 
 ```bash
 kubectl patch deployment argocd-repo-server \
@@ -666,11 +706,15 @@ AVP_POD=$(kubectl get pod -n argocd -l app.kubernetes.io/name=argocd-repo-server
 kubectl exec -it "$AVP_POD" -n argocd -c avp -- argocd-vault-plugin version
 ```
 
----
+<details>
+<summary>If the avp sidecar gets ImagePullBackOff for alpine:3.18</summary>
 
-### Step 6 — Create AVP Credentials Secret in Kubernetes
-
-> ⚠️ **Do this BEFORE applying the repo-server patch (Step 5).** The patch references this secret — if it doesn't exist, the `avp` sidecar container will fail to start with `secret "argocd-vault-plugin-credentials" not found`.
+```bash
+docker pull alpine:3.18
+kind load docker-image alpine:3.18 --name desktop
+kubectl rollout restart deployment/argocd-repo-server -n argocd
+```
+</details>
 
 With Kubernetes auth, **no Role ID or Secret ID are needed**. The secret only contains:
 - `VAULT_ADDR` — the Vault address **reachable from inside pods** (not `localhost`)
