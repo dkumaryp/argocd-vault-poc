@@ -278,6 +278,8 @@ curl -s \
 
 Tell Vault how to reach the K8s API and which token to use for TokenReview calls.
 
+> ⚠️ **Critical for Vault running outside K8s (Docker/VM)**: You MUST set `disable_local_ca_jwt: true`. Without it, Vault tries to read `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` from its own container — which doesn't exist outside K8s — and silently falls back to broken behavior, causing every login to return `403 permission denied` even when the reviewer token and CA cert are correctly provided.
+
 ```bash
 # Extract the vault-reviewer's JWT (Vault uses this to call K8s TokenReview API)
 REVIEWER_JWT=$(kubectl get secret vault-reviewer-token -n argocd \
@@ -287,23 +289,38 @@ REVIEWER_JWT=$(kubectl get secret vault-reviewer-token -n argocd \
 K8S_CA=$(kubectl get secret vault-reviewer-token -n argocd \
   -o jsonpath='{.data.ca\.crt}' | base64 -d)
 
-# Configure Vault's kubernetes auth
-curl -s \
-  --header "X-Vault-Token: $VAULT_TOKEN" \
-  --request POST \
-  --data "{
-    \"kubernetes_host\": \"https://${KIND_CP_IP}:6443\",
-    \"kubernetes_ca_cert\": $(echo "$K8S_CA" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),
-    \"token_reviewer_jwt\": $(echo "$REVIEWER_JWT" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),
-    \"disable_iss_validation\": true
-  }" \
-  $VAULT_ADDR/v1/auth/kubernetes/config | python3 -m json.tool
+# Write config to a temp file — avoids shell escaping issues with large JWT/cert values
+python3 -c "
+import json, sys
+payload = {
+    'kubernetes_host': 'https://' + sys.argv[1] + ':6443',
+    'token_reviewer_jwt': sys.argv[2],
+    'kubernetes_ca_cert': sys.argv[3],
+    'disable_iss_validation': True,
+    'disable_local_ca_jwt': True   # REQUIRED when Vault runs outside K8s
+}
+print(json.dumps(payload))
+" "$KIND_CP_IP" "$REVIEWER_JWT" "$K8S_CA" > /tmp/vault-k8s-config.json
 
-# Verify
-curl -s \
-  --header "X-Vault-Token: $VAULT_TOKEN" \
-  $VAULT_ADDR/v1/auth/kubernetes/config | python3 -m json.tool
-# Check kubernetes_host matches your KIND_CP_IP
+# Apply — must run curl from a host that can reach Vault's actual IP
+# On macOS with kind: use docker exec to send the request from inside Vault's network
+docker cp /tmp/vault-k8s-config.json vault-poc-dev:/tmp/vault-k8s-config.json
+docker exec vault-poc-dev sh -c \
+  "wget -qO- --header='X-Vault-Token: root' --header='Content-Type: application/json' \
+   --post-file=/tmp/vault-k8s-config.json \
+   http://${VAULT_KIND_IP}:8200/v1/auth/kubernetes/config && echo 'Config OK'"
+
+rm /tmp/vault-k8s-config.json
+
+# Verify — confirm disable_local_ca_jwt is true
+docker exec vault-poc-dev sh -c \
+  "wget -qO- --header='X-Vault-Token: root' \
+   http://${VAULT_KIND_IP}:8200/v1/auth/kubernetes/config" \
+  | python3 -m json.tool | grep -E "disable_local|disable_iss|kubernetes_host"
+# Expected:
+#   "disable_iss_validation": true,
+#   "disable_local_ca_jwt": true,
+#   "kubernetes_host": "https://172.19.0.5:6443",
 ```
 
 ---
@@ -782,7 +799,7 @@ Edit `argocd/apps/demo-secret-app.yaml` and set your Git repo URL:
 source:
   repoURL: https://github.com/dkumaryp/argocd-vault-poc.git
   targetRevision: HEAD
-  path: argocd-vault-poc/demo-app   # adjust if your repo layout differs
+  path: demo-app   # path inside the repo (repo root = argocd-vault-poc/)
 ```
 
 #### 7c. Register the repo with ArgoCD (if private)
