@@ -776,96 +776,69 @@ AVP sidecar pod
 
 ---
 
-### Step 7 — Push Demo App to Git and Deploy via ArgoCD
+### Step 7 — Deploy via ArgoCD
 
-ArgoCD is GitOps-based — it syncs from a Git repository. You need to host the `demo-app/` directory in a Git repo that ArgoCD can access.
+The repo is already at `https://github.com/dkumaryp/argocd-vault-poc.git`. The Application manifest is pre-configured.
 
-#### 7a. Push to Git
-
-```bash
-# Option 1: Push this entire poc directory to GitHub
-git init
-git remote add origin https://github.com/dkumaryp/argocd-vault-poc.git
-git add .
-git commit -m "feat: ArgoCD Vault Plugin POC"
-git push -u origin main
-```
-
-#### 7b. Update the ArgoCD Application manifest
-
-Edit `argocd/apps/demo-secret-app.yaml` and set your Git repo URL:
-
-```yaml
-source:
-  repoURL: https://github.com/dkumaryp/argocd-vault-poc.git
-  targetRevision: HEAD
-  path: demo-app   # path inside the repo (repo root = argocd-vault-poc/)
-```
-
-#### 7c. Register the repo with ArgoCD (if private)
-
-```bash
-argocd repo add https://github.com/dkumaryp/argocd-vault-poc.git \
-  --username YOUR_USER \
-  --password YOUR_PAT_TOKEN
-```
-
-#### 7d. Deploy the ArgoCD Application
+#### 7a. Apply the ArgoCD Application
 
 ```bash
 kubectl apply -f argocd/apps/demo-secret-app.yaml
-
-# Watch sync status
-kubectl get applications -n argocd
-argocd app get demo-secret-app
-argocd app sync demo-secret-app   # manual sync if auto-sync is off
 ```
+
+#### 7b. Sync the app
+
+```bash
+# If auto-sync doesn't trigger within 30s, sync manually
+argocd app sync demo-secret-app --force
+
+# Watch status
+argocd app get demo-secret-app
+kubectl get applications -n argocd
+```
+
+> ℹ️ **"Resource not found in cluster"** in ArgoCD UI is expected before the first sync — it just means the resources don't exist yet. Click **Sync** to create them.
+
+#### 7c. If sync fails with a cached error
+
+```bash
+# Hard refresh clears the cached manifest error, then sync
+argocd app terminate-op demo-secret-app
+argocd app sync demo-secret-app --force
+```
+
+Or in the ArgoCD UI: click **Hard Refresh** → then **Sync**.
 
 ---
 
 ### Step 8 — Verify Secrets Are Injected
 
-#### Check the Kubernetes Secret was created with real values:
-
 ```bash
-# Decode all secret keys
-kubectl get secret demo-secret -n demo -o jsonpath='{.data}' | \
-  python3 -c "
-import sys, json, base64
-d = json.load(sys.stdin)
-for k, v in d.items():
-    print(f'  {k}: {base64.b64decode(v).decode()}')
-"
+# Confirm resources were created
+kubectl get ns demo
+kubectl get secret demo-secret -n demo
+kubectl get deployment demo-app -n demo
 
-# Expected output:
-#   username: demo-user
-#   password: super-secret-password
+# ✅ THE KEY CHECK — decoded secret values must come from Vault, not placeholders
+kubectl get secret demo-secret -n demo \
+  -o go-template='{{range $k,$v := .data}}{{$k}}: {{$v | base64decode}}{{"\n"}}{{end}}'
+# Expected (your actual Vault values):
 #   api-key: 1234567890abcdef
 #   db-host: postgres.internal
 #   db-name: appdb
-```
+#   password: uper-secret-password
+#   username: demo-user
 
-#### Check the demo pod has the env vars:
-
-```bash
+# Verify the deployment pod has env vars from the secret
 DEMO_POD=$(kubectl get pod -n demo -l app=demo-app -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -it "$DEMO_POD" -n demo -- env | grep -E "APP_|DB_"
-
-# Expected:
-#   APP_USERNAME=demo-user
-#   APP_PASSWORD=super-secret-password
-#   APP_API_KEY=1234567890abcdef
-#   DB_HOST=postgres.internal
 ```
 
-#### Verify the Git secret still has placeholders (not real values):
+**✅ POC success criteria:**
+- `kubectl get secret demo-secret -n demo` → exists, created by ArgoCD
+- Decoded values = real Vault values (not `<username>`, `<password>` etc.)
+- `cat demo-app/secret.yaml` → still shows `<placeholders>` in Git
 
-```bash
-cat demo-app/secret.yaml | grep -E "<|>"
-# Should show: <username>, <password>, <api-key>, etc.
-```
-
-**✅ If you see real values in the cluster but placeholders in Git — the POC works!**
 
 ---
 
@@ -950,76 +923,158 @@ stringData:
 
 ## Troubleshooting
 
-### AVP sidecar CrashLoopBackOff
+All issues actually encountered during this POC, in the order they appeared.
+
+### ❌ ImagePullBackOff for redis / dex / ubuntu
+
+**Cause**: Transient network failure inside kind VM pulling from Docker Hub (`unexpected EOF`).
+
+```bash
+# Fix: pull on Mac and load directly into kind — bypasses in-VM network
+docker pull redis:7.0.14-alpine
+docker pull ghcr.io/dexidp/dex:v2.37.0
+kind load docker-image redis:7.0.14-alpine --name desktop
+kind load docker-image ghcr.io/dexidp/dex:v2.37.0 --name desktop
+kubectl delete pod -n argocd -l app.kubernetes.io/name=argocd-redis
+kubectl delete pod -n argocd -l app.kubernetes.io/name=dex
+```
+
+Or avoid entirely: use `core-install.yaml` instead of `install.yaml` (no Dex/Redis).
+
+---
+
+### ❌ avp sidecar ImagePullBackOff for ubuntu:22.04
+
+**Cause**: The AVP sidecar image was set to `ubuntu:22.04` — heavy image, slow pull, fails on flaky network.
+
+**Fix**: Change `image: ubuntu:22.04` → `image: alpine:3.18` in `argocd-repo-server-patch.yaml`. Alpine is already cached on the node from the init container.
+
+---
+
+### ❌ Vault 403 permission denied on kubernetes login
+
+**Cause**: `disable_local_ca_jwt: false` (Vault default) makes Vault look for `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` inside its container. Since Vault runs in Docker (not K8s), that file doesn't exist — Vault silently ignores your configured `kubernetes_ca_cert` and fails every login.
+
+**Fix**: Always set `disable_local_ca_jwt: true` when Vault runs outside K8s.
+
+**Diagnose**:
+```bash
+# Confirm the setting
+curl -s -H "X-Vault-Token: root" \
+  http://localhost:8200/v1/auth/kubernetes/config | python3 -m json.tool | grep disable_local
+# Must be: "disable_local_ca_jwt": true
+
+# Test login (run from inside Vault container — Mac can't reach kind IPs)
+docker exec vault-poc-dev sh -c \
+  "wget -qO- --header='Content-Type: application/json' \
+   --post-data='{\"jwt\":\"'\"$(kubectl exec -n argocd \
+     $(kubectl get pod -n argocd -l app.kubernetes.io/name=argocd-repo-server \
+       -o jsonpath='{.items[0].metadata.name}') \
+     -c avp -- cat /var/run/secrets/kubernetes.io/serviceaccount/token)'\"',\"role\":\"argocd-role\"}' \
+   http://172.19.0.6:8200/v1/auth/kubernetes/login" | python3 -m json.tool | grep client_token
+```
+
+**Re-apply config** (must use `docker exec` — `curl localhost` from Mac drops large payloads):
+```bash
+REVIEWER_JWT=$(kubectl get secret vault-reviewer-token -n argocd -o jsonpath='{.data.token}' | base64 -d)
+K8S_CA=$(kubectl get secret vault-reviewer-token -n argocd -o jsonpath='{.data.ca\.crt}' | base64 -d)
+python3 -c "
+import json, sys
+print(json.dumps({
+  'kubernetes_host': 'https://172.19.0.5:6443',
+  'token_reviewer_jwt': sys.argv[1],
+  'kubernetes_ca_cert': sys.argv[2],
+  'disable_iss_validation': True,
+  'disable_local_ca_jwt': True
+}))
+" "$REVIEWER_JWT" "$K8S_CA" > /tmp/vk8s.json
+docker cp /tmp/vk8s.json vault-poc-dev:/tmp/vk8s.json
+docker exec vault-poc-dev sh -c \
+  "wget -qO- --header='X-Vault-Token: root' --header='Content-Type: application/json' \
+   --post-file=/tmp/vk8s.json http://172.19.0.6:8200/v1/auth/kubernetes/config && echo OK"
+rm /tmp/vk8s.json
+```
+
+---
+
+### ❌ Could not find secrets at path secret/data/demo-app
+
+**Cause**: Vault has two KV engines — `secret/` (auto-created by dev mode) and `secrets/` (where data actually lives). Wrong engine name in the annotation.
+
+**Fix**: Match the annotation to where your secrets actually are:
+```bash
+# Check which engine has your data
+curl -s -H "X-Vault-Token: root" \
+  http://localhost:8200/v1/secrets/data/demo-app | python3 -m json.tool | grep -E "username|error"
+
+# Update annotation in demo-app/secret.yaml
+avp.kubernetes.io/path: "secrets/data/demo-app"   # note: secrets/ not secret/
+```
+
+Also update the Vault policy to match:
+```bash
+curl -s -H "X-Vault-Token: root" --request POST \
+  --data '{"policy":"path \"secrets/data/*\" {\n  capabilities = [\"read\",\"list\"]\n}\npath \"secrets/metadata/*\" {\n  capabilities = [\"read\",\"list\"]\n}"}' \
+  http://localhost:8200/v1/sys/policies/acl/argocd-policy
+```
+
+---
+
+### ❌ Kustomization CRD not found
+
+**Cause**: ArgoCD auto-detects `kustomization.yaml` in the app path and routes to Kustomize instead of the AVP plugin — even when the plugin is explicitly configured.
+
+**Fix**: Delete `demo-app/kustomization.yaml`. AVP works in plain directory mode on raw `*.yaml` files.
+
+---
+
+### ❌ "Resource not found in cluster" for all demo-app resources
+
+**Cause**: This is NOT an error — it means AVP successfully generated the manifests but ArgoCD hasn't applied them yet (waiting for Sync).
+
+**Fix**: Click **Sync** in the ArgoCD UI, or:
+```bash
+argocd app sync demo-secret-app --force
+```
+
+---
+
+### ❌ AVP sidecar CrashLoopBackOff
 
 ```bash
 kubectl logs -n argocd -l app.kubernetes.io/name=argocd-repo-server -c avp
-
 # Common causes:
-# - Secret 'argocd-vault-plugin-credentials' not found → run Step 6
-# - Vault unreachable from pod → check CLUSTER_VAULT_ADDR in Step 3
-# - Wrong AVP binary architecture (linux_amd64 vs arm64)
+# - secret "argocd-vault-plugin-credentials" not found → create it (Step 5c)
+# - Vault unreachable from pod → verify VAULT_KIND_IP (Step 3)
 ```
 
-### ArgoCD sync fails with "plugin not found"
+---
+
+### ❌ ArgoCD sync fails with "plugin not found"
 
 ```bash
-# Verify plugin is registered
-kubectl exec -n argocd -c avp \
-  $(kubectl get pod -n argocd -l app.kubernetes.io/name=argocd-repo-server \
-    -o jsonpath='{.items[0].metadata.name}') \
-  -- ls /home/argocd/cmp-server/plugins/
-
-# Verify ConfigMap
+# Verify plugin ConfigMap exists
 kubectl get cm cmp-plugin -n argocd -o yaml
-```
 
-### Vault connection refused from inside cluster
-
-```bash
-# Test connectivity from a pod
-kubectl run test --rm -it --image=alpine -- \
-  wget -qO- http://host.minikube.internal:8200/v1/sys/health
-
-# If it fails, try the host's actual IP:
-HOST_IP=$(kubectl get nodes -o wide | awk 'NR==2{print $6}')
-kubectl run test --rm -it --image=alpine -- \
-  wget -qO- http://$HOST_IP:8200/v1/sys/health
-```
-
-### Placeholders not replaced (secret has literal `<username>`)
-
-```bash
-# Check if AVP can authenticate with Vault
-kubectl logs -n argocd \
-  $(kubectl get pod -n argocd -l app.kubernetes.io/name=argocd-repo-server \
-    -o jsonpath='{.items[0].metadata.name}') -c avp | grep -i "error\|vault"
-
-# Manually test AppRole auth from pod
-kubectl exec -n argocd -c avp \
+# Verify AVP binary is in the sidecar
+kubectl exec -n argocd \
   $(kubectl get pod -n argocd -l app.kubernetes.io/name=argocd-repo-server \
     -o jsonpath='{.items[0].metadata.name}') \
-  -- argocd-vault-plugin generate /dev/stdin <<'EOF'
-apiVersion: v1
-kind: Secret
-metadata:
-  name: test
-  annotations:
-    avp.kubernetes.io/path: "secrets/data/demo-app"
-stringData:
-  username: <username>
-EOF
+  -c avp -- argocd-vault-plugin version
 ```
 
-### Vault is sealed after restart (prod mode)
+---
 
-```bash
-# Unseal with 3 of the 5 keys from .vault-keys
-VAULT_ADDR=http://localhost:8200
-vault operator unseal <key1>
-vault operator unseal <key2>
-vault operator unseal <key3>
-```
+### ❌ Vault connection refused / Bad hostname from Mac terminal
+
+**Cause**: Docker internal IPs (`172.19.x.x`) are inside Docker's Linux VM — not routable from macOS.
+
+**Fix**:
+- Mac → Vault: always use `http://localhost:8200`
+- Pods → Vault: use `http://${VAULT_KIND_IP}:8200` (Vault's kind network IP)
+- Run Vault API calls from inside the container: `docker exec vault-poc-dev sh -c "wget ..."`
+
+
 
 ---
 
@@ -1029,38 +1084,54 @@ When you update a secret in Vault, Kubernetes will **not** automatically update.
 
 ```bash
 # Update secret in Vault
-vault kv put secret/demo-app password="new-password-123"
+curl -s -H "X-Vault-Token: root" --request POST \
+  --data '{"data":{"password":"new-password-123"}}' \
+  http://localhost:8200/v1/secrets/data/demo-app
 
-# Force ArgoCD to re-sync (re-runs AVP)
+# Force ArgoCD to re-sync (re-runs AVP, replaces placeholders with new values)
 argocd app sync demo-secret-app --force
-
-# Or via kubectl
-kubectl annotate application demo-secret-app -n argocd \
-  argocd.argoproj.io/refresh=normal
 ```
 
-> For automatic secret rotation, consider using [External Secrets Operator](https://external-secrets.io/) alongside AVP, or set up a Vault agent to watch for changes.
+> For automatic secret rotation, consider using [External Secrets Operator](https://external-secrets.io/) or Vault Agent alongside AVP.
 
 ---
 
 ## Quick Reference Commands
 
 ```bash
-# Vault status
+# Vault health (from Mac)
 curl http://localhost:8200/v1/sys/health | python3 -m json.tool
 
-# List secrets
-VAULT_TOKEN=root vault kv list secret/
+# List secrets in engine
+curl -s -H "X-Vault-Token: root" --request LIST \
+  http://localhost:8200/v1/secrets/metadata | python3 -m json.tool
+
+# Read a secret
+curl -s -H "X-Vault-Token: root" \
+  http://localhost:8200/v1/secrets/data/demo-app | python3 -m json.tool
+
+# Test Vault login (simulates what AVP does at sync time)
+docker exec vault-poc-dev sh -c \
+  "wget -qO- --header='Content-Type: application/json' \
+   --post-data='{\"role\":\"argocd-role\",\"jwt\":\"'\"$(kubectl exec -n argocd \
+     $(kubectl get pod -n argocd -l app.kubernetes.io/name=argocd-repo-server \
+       -o jsonpath='{.items[0].metadata.name}') \
+     -c avp -- cat /var/run/secrets/kubernetes.io/serviceaccount/token)'\"'}' \
+   http://172.19.0.6:8200/v1/auth/kubernetes/login" | python3 -m json.tool | grep client_token
 
 # ArgoCD app status
 argocd app list
 argocd app get demo-secret-app
 
-# View AVP logs
+# Force re-sync
+argocd app sync demo-secret-app --force
+
+# View AVP logs (live)
 kubectl logs -n argocd -l app.kubernetes.io/name=argocd-repo-server -c avp -f
 
-# Decode all keys in a secret
-kubectl get secret demo-secret -n demo -o go-template='{{range $k,$v := .data}}{{$k}}: {{$v | base64decode}}{{"\n"}}{{end}}'
+# Decode all keys in the deployed secret
+kubectl get secret demo-secret -n demo \
+  -o go-template='{{range $k,$v := .data}}{{$k}}: {{$v | base64decode}}{{"\n"}}{{end}}'
 ```
 
 ---
