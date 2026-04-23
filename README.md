@@ -225,12 +225,12 @@ curl -s \
       "db-name": "appdb"
     }
   }' \
-  $VAULT_ADDR/v1/secret/data/demo-app | python3 -m json.tool
+  $VAULT_ADDR/v1/secrets/data/demo-app | python3 -m json.tool
 
 # Read it back to confirm
 curl -s \
   --header "X-Vault-Token: $VAULT_TOKEN" \
-  $VAULT_ADDR/v1/secret/data/demo-app | python3 -m json.tool
+  $VAULT_ADDR/v1/secrets/data/demo-app | python3 -m json.tool
 # Look for "data": { "username": "demo-user", ... } in the response
 ```
 
@@ -245,7 +245,7 @@ curl -s \
   --header "X-Vault-Token: $VAULT_TOKEN" \
   --request PUT \
   --data '{
-    "policy": "path \"secret/data/*\" { capabilities = [\"read\", \"list\"] }\npath \"secret/metadata/*\" { capabilities = [\"read\", \"list\"] }"
+    "policy": "path \"secrets/data/*\" { capabilities = [\"read\", \"list\"] }\npath \"secrets/metadata/*\" { capabilities = [\"read\", \"list\"] }"
   }' \
   $VAULT_ADDR/v1/sys/policies/acl/argocd-policy
 
@@ -372,7 +372,7 @@ echo "Got Vault token: $VAULT_CLIENT_TOKEN"
 # Use that token to read the secret — this is exactly what AVP does
 curl -s \
   --header "X-Vault-Token: $VAULT_CLIENT_TOKEN" \
-  $VAULT_ADDR/v1/secret/data/demo-app | python3 -m json.tool
+  $VAULT_ADDR/v1/secrets/data/demo-app | python3 -m json.tool
 # Should show your demo-app secret values
 ```
 
@@ -426,10 +426,10 @@ Open **http://localhost:8200** and sign in with token `root`.
 4. Paste this into the **Policy** editor:
 
    ```hcl
-   path "secret/data/*" {
+   path "secrets/data/*" {
      capabilities = ["read", "list"]
    }
-   path "secret/metadata/*" {
+   path "secrets/metadata/*" {
      capabilities = ["read", "list"]
    }
    ```
@@ -770,7 +770,7 @@ AVP sidecar pod
   → Vault calls K8s TokenReview API using vault-reviewer token
   → K8s confirms: SA=argocd-repo-server, namespace=argocd ✓
   → Vault issues short-lived Vault token
-  → AVP uses Vault token to read secret/data/demo-app
+  → AVP uses Vault token to read secrets/data/demo-app
   → Placeholders replaced in manifests
 ```
 
@@ -924,7 +924,7 @@ Address reference:
 # In secret.yaml:
 metadata:
   annotations:
-    avp.kubernetes.io/path: "secret/data/demo-app"  # Vault path
+    avp.kubernetes.io/path: "secrets/data/demo-app"  # Vault path
 stringData:
   username: <username>   # key name in Vault KV secret
   password: <password>
@@ -934,8 +934,8 @@ stringData:
 
 ```yaml
 stringData:
-  username: <path:secret/data/demo-app#username>
-  password: <path:secret/data/demo-app#password>
+  username: <path:secrets/data/demo-app#username>
+  password: <path:secrets/data/demo-app#password>
 ```
 
 ### Versioned secret
@@ -943,7 +943,7 @@ stringData:
 ```yaml
 stringData:
   # Fetch a specific version of the secret
-  password: <path:secret/data/demo-app#password | version=2>
+  password: <path:secrets/data/demo-app#password | version=2>
 ```
 
 ---
@@ -1005,7 +1005,7 @@ kind: Secret
 metadata:
   name: test
   annotations:
-    avp.kubernetes.io/path: "secret/data/demo-app"
+    avp.kubernetes.io/path: "secrets/data/demo-app"
 stringData:
   username: <username>
 EOF
