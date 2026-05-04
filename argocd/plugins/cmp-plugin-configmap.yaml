@@ -29,7 +29,7 @@ data:
       # Generate: run AVP to replace placeholders with Vault secrets
       generate:
         command:
-          - argocd-vault-plugin
+          - /usr/local/bin/argocd-vault-plugin
           - generate
           - ./
 
